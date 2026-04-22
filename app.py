@@ -23,6 +23,15 @@ analyzer = SentimentIntensityAnalyzer()
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "demo")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
 
+# API Status helper
+def get_api_status():
+    if FINNHUB_API_KEY and FINNHUB_API_KEY != "demo":
+        return "✅ Finnhub Connected", True
+    elif ALPHA_VANTAGE_API_KEY and ALPHA_VANTAGE_API_KEY != "demo":
+        return "⚠️ Using Alpha Vantage fallback (limited)", True
+    else:
+        return "❌ No valid API key - using demo mode (very limited data)", False
+
 # Default watchlist
 DEFAULT_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 
@@ -38,34 +47,78 @@ def save_watchlist(watchlist: List[str]):
     st.session_state.watchlist = [t.upper() for t in watchlist]
     # Note: In production, persist to file or DB
 
-def get_finnhub_news(tickers: List[str], limit: int = 20) -> pd.DataFrame:
-    """Fetch recent company news from Finnhub."""
+def get_finnhub_news(tickers: List[str], days_back: int = 7, limit: int = 20) -> pd.DataFrame:
+    """Fetch recent company news from Finnhub with fallback to Alpha Vantage."""
     all_news = []
-    for ticker in tickers[:5]:  # Limit to avoid rate limits
-        try:
-            url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')}&to={datetime.now().strftime('%Y-%m-%d')}&token={FINNHUB_API_KEY}"
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                news = response.json()
-                for item in news[:limit//len(tickers)]:
-                    if isinstance(item, dict):
-                        item["ticker"] = ticker
-                        # Compute sentiment if not provided
-                        if "sentiment" not in item or not item.get("sentiment"):
+    errors = []
+
+    # Try Finnhub first (preferred - more complete articles)
+    if FINNHUB_API_KEY and FINNHUB_API_KEY != "demo":
+        for ticker in tickers[:5]:  # Limit concurrent calls
+            try:
+                from_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+                url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={from_date}&to={datetime.now().strftime('%Y-%m-%d')}&token={FINNHUB_API_KEY}"
+                response = requests.get(url, timeout=10)
+                
+                if response.status_code == 200:
+                    news = response.json()
+                    for item in news[:limit//len(tickers) + 2]:
+                        if isinstance(item, dict) and item.get("headline"):
+                            item["ticker"] = ticker
+                            item["source_api"] = "finnhub"
+                            # Compute sentiment
                             text = item.get("headline", "") + " " + item.get("summary", "")
                             scores = analyzer.polarity_scores(text)
                             item["compound"] = scores["compound"]
-                            item["sentiment_label"] = "positive" if scores["compound"] > 0.05 else "negative" if scores["compound"] < -0.05 else "neutral"
-                        all_news.append(item)
+                            item["sentiment_label"] = ("positive" if scores["compound"] > 0.05 
+                                                    else "negative" if scores["compound"] < -0.05 
+                                                    else "neutral")
+                            all_news.append(item)
+                elif response.status_code == 403:
+                    errors.append(f"Finnhub API key invalid (403)")
+                else:
+                    errors.append(f"Finnhub returned {response.status_code} for {ticker}")
+            except Exception as e:
+                errors.append(f"Finnhub error for {ticker}: {str(e)}")
+                continue
+
+    # Fallback to Alpha Vantage if no/limited Finnhub results
+    if len(all_news) < 5 and ALPHA_VANTAGE_API_KEY and ALPHA_VANTAGE_API_KEY != "demo":
+        try:
+            tickers_str = ",".join(tickers[:5])
+            url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={tickers_str}&apikey={ALPHA_VANTAGE_API_KEY}&limit=20"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                feed = data.get("feed", [])
+                for item in feed:
+                    if isinstance(item, dict):
+                        # Alpha Vantage format is slightly different
+                        news_item = {
+                            "headline": item.get("title", ""),
+                            "summary": item.get("summary", ""),
+                            "url": item.get("url", ""),
+                            "datetime": item.get("time_published", ""),
+                            "ticker": item.get("ticker", tickers[0] if tickers else "UNKNOWN"),
+                            "source_api": "alphavantage",
+                            "compound": float(item.get("overall_sentiment_score", 0.5)),
+                            "sentiment_label": item.get("overall_sentiment_label", "neutral").lower()
+                        }
+                        all_news.append(news_item)
         except Exception as e:
-            st.warning(f"Error fetching news for {ticker}: {e}")
-            continue
+            errors.append(f"Alpha Vantage fallback failed: {str(e)}")
+
     df = pd.DataFrame(all_news)
     if not df.empty:
-        df = df.sort_values("datetime", ascending=False)
-        # Convert datetime if string
+        # Normalize datetime column
         if "datetime" in df.columns:
-            df["datetime"] = pd.to_datetime(df["datetime"], unit='s', errors='coerce')
+            df["datetime"] = pd.to_datetime(df["datetime"], errors='coerce')
+            df = df.sort_values("datetime", ascending=False)
+    
+    # Store errors for display (using session state since this is cached)
+    if errors and "news_errors" not in st.session_state:
+        st.session_state.news_errors = errors[:3]  # limit noise
+    
     return df
 
 def get_google_trends(tickers: List[str], timeframe: str = "today 3-m") -> Dict:
@@ -171,8 +224,12 @@ st.markdown("**Get ahead of the market** with real-time news sentiment, Google T
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_status = "✅ Connected" if FINNHUB_API_KEY and FINNHUB_API_KEY != "demo" else "⚠️ Using demo key - get free key at finnhub.io"
-    st.info(api_status)
+    status_text, has_key = get_api_status()
+    st.info(status_text)
+    
+    if not has_key:
+        st.warning("⚠️ Get a free Finnhub API key at https://finnhub.io/register and add it to your `.env` file as `FINNHUB_API_KEY=your_key`")
+        st.caption("Without a real key, news data will be very limited.")
     
     st.subheader("Watchlist")
     current_watchlist = load_watchlist()
@@ -187,7 +244,9 @@ with st.sidebar:
     news_days = st.slider("News lookback (days)", 1, 30, 7)
     trends_period = st.selectbox("Trends period", ["today 3-m", "today 1-y", "2024-01-01 2026-04-21"])
     
-    if st.button("🔄 Refresh All Data"):
+    if st.button("🔄 Refresh All Data", type="primary"):
+        if "news_errors" in st.session_state:
+            del st.session_state.news_errors  # Clear previous errors
         st.session_state.refresh = True
         st.rerun()
 
@@ -197,26 +256,39 @@ tab1, tab2, tab3, tab4 = st.tabs(["📰 Live News Feed", "📊 Google Trends & A
 watchlist = load_watchlist()
 
 # Cache data where possible
-@st.cache_data(ttl=300)  # 5 min cache
-def fetch_all_data(watchlist_tuple):
-    news_df = get_finnhub_news(list(watchlist_tuple))
+@st.cache_data(ttl=180)  # Reduced TTL so changes to API key are picked up faster
+def fetch_all_data(watchlist_tuple, news_days):
+    news_df = get_finnhub_news(list(watchlist_tuple), days_back=news_days)
     trends = get_google_trends(list(watchlist_tuple))
     stock_df = get_stock_data(list(watchlist_tuple))
     movers = calculate_composite_score(news_df, trends, stock_df)
     return news_df, trends, stock_df, movers
 
-news_df, trends_data, stock_df, movers_df = fetch_all_data(tuple(watchlist))
+news_df, trends_data, stock_df, movers_df = fetch_all_data(tuple(watchlist), news_days)
 
 with tab1:
     st.header("Live News Feed with Sentiment")
+    
     if news_df.empty:
-        st.info("No news found. Check your Finnhub API key or try different tickers.")
+        st.error("**No news found**")
+        st.info("This usually means you are using the demo API key. Please get a free Finnhub key:")
+        st.code("FINNHUB_API_KEY=your_key_here", language="bash")
+        st.markdown("[Get Free Key →](https://finnhub.io/register)")
+        
+        if "news_errors" in st.session_state and st.session_state.news_errors:
+            with st.expander("Debug Info"):
+                for err in st.session_state.news_errors:
+                    st.warning(err)
     else:
+        st.success(f"Found **{len(news_df)}** recent articles")
         # Filter and display
         for _, row in news_df.head(15).iterrows():
             sentiment_color = "🟢" if row.get("compound", 0) > 0.1 else "🔴" if row.get("compound", 0) < -0.1 else "⚪"
-            with st.expander(f"{sentiment_color} {row.get('headline', 'No headline')} ({row.get('ticker', '')})"):
-                st.caption(f"{row.get('datetime', 'N/A')} | Sentiment: {row.get('compound', 0):.2f}")
+            source = row.get("source_api", "news").upper()
+            with st.expander(f"{sentiment_color} {row.get('headline', 'No headline')} ({row.get('ticker', '')}) [{source}]"):
+                dt = row.get('datetime')
+                st.caption(f"{dt.strftime('%Y-%m-%d %H:%M') if hasattr(dt, 'strftime') else str(dt)} | "
+                          f"Sentiment: **{row.get('compound', 0):.2f}**")
                 st.write(row.get("summary", "No summary available"))
                 if "url" in row and row["url"]:
                     st.markdown(f"[Read full article]({row['url']})")
@@ -225,6 +297,8 @@ with tab1:
     if not news_df.empty and "compound" in news_df.columns:
         fig = px.histogram(news_df, x="compound", nbins=20, title="Sentiment Score Distribution")
         st.plotly_chart(fig, width="stretch")
+    else:
+        st.info("Sentiment chart will appear once news data is available.")
 
 with tab2:
     st.header("Google Trends - Leading Alternative Data")
