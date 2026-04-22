@@ -7,6 +7,7 @@ vaderSentiment>=3.3.2
 pytrends>=4.9.2
 plotly>=5.0.0
 numpy>=1.24.0
+matplotlib>=3.5.0
 python-dateutil>=2.8.0
 # For better sentiment (optional, uncomment if GPU available)
 # transformers>=4.0.0

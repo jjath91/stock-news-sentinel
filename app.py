@@ -224,7 +224,7 @@ with tab1:
     st.subheader("News Sentiment Distribution")
     if not news_df.empty and "compound" in news_df.columns:
         fig = px.histogram(news_df, x="compound", nbins=20, title="Sentiment Score Distribution")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 with tab2:
     st.header("Google Trends - Leading Alternative Data")
@@ -246,13 +246,33 @@ with tab2:
     
     # Plot trends for selected
     selected_ticker = st.selectbox("Select ticker for detailed trend", watchlist)
-    if selected_ticker in trends_data and "trend_df" in trends_data[selected_ticker]:
-        trend_df = trends_data[selected_ticker]["trend_df"]
+    if (selected_ticker in trends_data and 
+        isinstance(trends_data[selected_ticker], dict) and 
+        "trend_df" in trends_data[selected_ticker]):
+        
+        trend_df = trends_data[selected_ticker]["trend_df"].copy()
         if not trend_df.empty:
-            fig = px.line(trend_df, title=f"Google Search Trends for {selected_ticker}")
-            st.plotly_chart(fig, use_container_width=True)
+            # pytrends returns wide-format data with an 'isPartial' boolean column.
+            # This causes Plotly Express "different type" error. Drop non-numeric columns.
+            if "isPartial" in trend_df.columns:
+                trend_df = trend_df.drop(columns=["isPartial"])
+            
+            # Plot all keyword trends (multi-line) - cleaner than wide-form defaults
+            fig = px.line(
+                trend_df, 
+                title=f"Google Search Trends for {selected_ticker} (last {len(trend_df)} periods)",
+                labels={"value": "Search Interest (0-100)", "index": "Date"},
+                markers=True
+            )
+            fig.update_layout(hovermode="x unified", legend_title="Keyword")
+            st.plotly_chart(fig, width="stretch")
+            
+            # Show summary stats
+            st.caption(f"Average interest: {trends_data[selected_ticker].get('avg_interest', 0)} | "
+                      f"Peak: {trends_data[selected_ticker].get('peak', 0)} | "
+                      f"Recent momentum: {trends_data[selected_ticker].get('recent_change', 0):+.1f}%")
     else:
-        st.warning("No trend data available for this ticker. pytrends may have rate limits.")
+        st.warning("No trend data available for this ticker. pytrends may have rate limits or Google is throttling requests.")
 
 with tab3:
     st.header("🚀 Potential Big Movers")
@@ -265,7 +285,7 @@ with tab3:
             st.success(f"**HIGH CONVICTION MOVERS DETECTED**: {len(high_conviction)} tickers")
             st.dataframe(
                 high_conviction.style.background_gradient(subset=["composite_score"], cmap="RdYlGn"),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         
@@ -273,14 +293,14 @@ with tab3:
         st.dataframe(
             movers_df.style.background_gradient(subset=["composite_score"], cmap="RdYlGn")
             .format({"composite_score": "{:.1f}", "sentiment": "{:.1f}"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
         
         # Visualization
         fig = px.bar(movers_df, x="ticker", y="composite_score", color="signal_strength",
                     title="Composite Mover Scores", color_discrete_map={"HIGH": "green", "MEDIUM": "orange", "LOW": "gray"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("Add more data or refresh to see mover rankings.")
 
